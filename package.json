@@ -1,0 +1,13 @@
+{
+  "name": "belavita-facturacion",
+  "version": "1.0.0",
+  "description": "Servicio de facturación electrónica ARCA/AFIP - Belavita Ops",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@afipsdk/afip.js": "^1.2.3",
+    "@supabase/supabase-js": "^2.0.0"
+  }
+}
