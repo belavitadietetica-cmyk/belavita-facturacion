@@ -26,17 +26,28 @@ const TASA_IVA = 0.21;
 const IVA_ID_21 = 5; // código AFIP para alícuota 21%
 
 // Tipos de comprobante AFIP (códigos fijos y estándar, no cambian)
-const CBTE_TIPO = { factura_a: 1, factura_b: 6 };
+//   1  = Factura A  · emisor Responsable Inscripto, receptor RI
+//   6  = Factura B  · emisor Responsable Inscripto, receptor CF
+//   11 = Factura C  · emisor MONOTRIBUTISTA. No discrimina IVA.
+const CBTE_TIPO = { factura_a: 1, factura_b: 6, factura_c: 11 };
 
-// Un solo punto de venta habilitado en ARCA por sucursal — Tomás confirmó
-// que son 3 puntos de venta distintos. Se completan cuando los tenga
-// confirmados; por ahora quedan en null (el POST /facturar los recibe
-// como parámetro igual, así no bloqueamos el desarrollo del resto)
-const PUNTO_VENTA_POR_SUCURSAL = {
-  bv1: process.env.PUNTO_VENTA_BV1 ? parseInt(process.env.PUNTO_VENTA_BV1, 10) : null,
-  bv2: process.env.PUNTO_VENTA_BV2 ? parseInt(process.env.PUNTO_VENTA_BV2, 10) : null,
-  bv3: process.env.PUNTO_VENTA_BV3 ? parseInt(process.env.PUNTO_VENTA_BV3, 10) : null,
-};
+// Un punto de venta habilitado en ARCA por sucursal, cargado por variable
+// de entorno: PUNTO_VENTA_BV1, PUNTO_VENTA_BV2, PUNTO_VENTA_LOCAL, etc.
+//
+// Se resuelve al vuelo y no con una lista fija: antes estaban escritas las
+// tres sucursales de Belavita, así que un cliente con otro sucursal_id
+// nunca encontraba su punto de venta aunque la variable estuviera cargada.
+function claveDePuntoVenta(sucursalId) {
+  return 'PUNTO_VENTA_' + String(sucursalId || '').toUpperCase().replace(/[^A-Z0-9]/g, '_');
+}
+
+function puntoVentaDe(sucursalId) {
+  if (!sucursalId) return null;
+  const valor = process.env[claveDePuntoVenta(sucursalId)];
+  if (!valor) return null;
+  const n = parseInt(valor, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
 
 // Cola simple: procesa una factura a la vez, para que dos ventas casi
 // simultáneas nunca pidan el mismo número de comprobante a ARCA
@@ -98,18 +109,33 @@ async function anotarEnVenta(ventaPosId, patch) {
 // Arma y emite un comprobante — separado de la parte HTTP para poder
 // testearlo o reusarlo fácil
 async function emitirComprobante({ sucursal_id, punto_venta, tipo_comprobante, total, cliente }) {
-  const puntoVenta = punto_venta || PUNTO_VENTA_POR_SUCURSAL[sucursal_id];
-  if (!puntoVenta) throw new Error(`No hay punto de venta configurado para ${sucursal_id}. Definí PUNTO_VENTA_${(sucursal_id||'').toUpperCase()} en Railway.`);
+  const puntoVenta = punto_venta || puntoVentaDe(sucursal_id);
+  // El mensaje dice EXACTAMENTE la variable que hay que crear: si dijera
+  // otra —por ejemplo con un guion donde va un guion bajo— quien la copie
+  // cargaría una que el código nunca va a leer.
+  if (!puntoVenta) throw new Error(`No hay punto de venta configurado para "${sucursal_id}". Definí ${claveDePuntoVenta(sucursal_id)} en Railway.`);
 
   const cbteTipo = CBTE_TIPO[tipo_comprobante];
-  if (!cbteTipo) throw new Error(`tipo_comprobante inválido: "${tipo_comprobante}" (esperaba "factura_a" o "factura_b")`);
+  if (!cbteTipo) throw new Error(`tipo_comprobante inválido: "${tipo_comprobante}" (esperaba factura_a, factura_b o factura_c)`);
 
   const esFacturaA = tipo_comprobante === 'factura_a';
+  const esFacturaC = tipo_comprobante === 'factura_c';
 
-  // El total ya viene con IVA incluido (así se vende en el mostrador) —
-  // se separa neto/IVA para declararlo como pide ARCA
-  const neto = Math.round((total / (1 + TASA_IVA)) * 100) / 100;
-  const iva = Math.round((total - neto) * 100) / 100;
+  // ── Los importes ────────────────────────────────────────────────────
+  // FACTURA A y B: el emisor es Responsable Inscripto y SÍ discrimina IVA.
+  // El total del mostrador ya lo lleva adentro, así que se separa.
+  //
+  // FACTURA C: el emisor es monotributista y NO discrimina IVA. Según las
+  // especificaciones del WSFEv1:
+  //   · ImpNeto  = el subtotal, o sea el total (ImpTotal = ImpNeto + ImpTrib)
+  //   · ImpIVA   = 0
+  //   · ImpOpEx  = 0
+  //   · el array Iva NO se informa  → error 10071 si se manda igual
+  //
+  // Dividir el total por 1,21 en una Factura C sería declarar un importe
+  // menor al que se cobró.
+  const neto = esFacturaC ? total : Math.round((total / (1 + TASA_IVA)) * 100) / 100;
+  const iva  = esFacturaC ? 0     : Math.round((total - neto) * 100) / 100;
 
   const data = {
     PtoVta: puntoVenta,
@@ -126,7 +152,9 @@ async function emitirComprobante({ sucursal_id, punto_venta, tipo_comprobante, t
     MonId: 'PES',
     MonCotiz: 1,
     CbteFch: parseInt(hoyYYYYMMDD(), 10),
-    Iva: [{ Id: IVA_ID_21, BaseImp: neto, Importe: iva }],
+    // El array de alícuotas solo va en A y B. En C su sola presencia hace
+    // que ARCA rechace el comprobante con el error 10071.
+    ...(esFacturaC ? {} : { Iva: [{ Id: IVA_ID_21, BaseImp: neto, Importe: iva }] }),
     // Campo obligatorio desde RG 5616 — 1: Responsable Inscripto, 5: Consumidor Final
     CondicionIVAReceptorId: esFacturaA ? 1 : 5,
   };
