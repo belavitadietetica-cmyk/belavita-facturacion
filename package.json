@@ -4,7 +4,8 @@
   "description": "Servicio de facturación electrónica ARCA/AFIP - Belavita Ops",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node pruebas/sesion.js"
   },
   "dependencies": {
     "@afipsdk/afip.js": "^1.2.3",
