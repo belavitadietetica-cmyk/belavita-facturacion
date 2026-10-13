@@ -4,6 +4,76 @@ const { createClient } = require('@supabase/supabase-js');
 
 const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
+// ── QUIÉN PUEDE PEDIR UNA FACTURA ───────────────────────────────────────
+//
+// La dirección de este servicio viaja dentro de la página de Cyron, que se
+// descarga sin login. Hasta ahora /facturar no pedía nada: cualquiera que la
+// leyera podía emitir comprobantes reales ante ARCA con el CUIT del comercio,
+// y escribir un CAE en cualquier venta con la clave de servicio.
+//
+// Ahora Cyron manda en cada pedido el token de la sesión de Supabase
+// (Authorization: Bearer ...), igual que con el asistente de IA. Acá se
+// valida contra la misma base y se exige que sea alguien activo del equipo
+// en ops.usuarios: la misma regla que usa la base para todo lo demás
+// (ops.es_equipo).
+//
+// EXIGIR_SESION decide qué pasa con un pedido sin sesión válida:
+//   · sin definir o "no" → pasa igual y queda anotado en el log
+//   · "si"               → se rechaza y no se emite nada
+// Arranca apagado para que desplegar esto no corte la facturación. Orden:
+//   1. desplegar esta versión (acepta el encabezado, todavía no lo exige)
+//   2. desplegar el Cyron que manda el token
+//   3. EXIGIR_SESION=si en las variables de Railway
+// GET /salud dice en qué estado está.
+const EXIGIR_SESION = /^(si|sí|true|1)$/i.test(String(process.env.EXIGIR_SESION || '').trim());
+
+// Desde qué páginas puede llamar un navegador (por ejemplo la URL de Cyron;
+// la app de escritorio abre esa misma URL). Vacío = cualquiera, como antes.
+// Es una capa más: lo que protege de verdad es la sesión, porque un pedido
+// que no sale de un navegador no mira estos permisos.
+const ORIGENES = String(process.env.ORIGENES_PERMITIDOS || '')
+  .split(',').map(o => o.trim().replace(/\/+$/, '')).filter(Boolean);
+
+function ponerCors(req, res) {
+  const origen = String(req.headers.origin || '').replace(/\/+$/, '');
+  if (!ORIGENES.length) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origen && ORIGENES.includes(origen)) {
+    res.setHeader('Access-Control-Allow-Origin', origen);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  // Authorization tiene que estar acá ANTES de que Cyron empiece a mandarlo:
+  // si no, el navegador corta el pedido en la consulta previa y la factura
+  // no sale. Por eso este servicio se despliega primero.
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+// Devuelve quién pide, o por qué no se le puede creer.
+async function quienPide(req) {
+  const m = String(req.headers.authorization || '').match(/^Bearer\s+(\S+)$/i);
+  if (!m) return { ok: false, codigo: 401, motivo: 'el pedido no trae la sesión del usuario' };
+  try {
+    const { data, error } = await sb.auth.getUser(m[1]);
+    // supabase-js no tira excepción si la base no contesta: devuelve un
+    // error sin código HTTP. Eso no es una sesión vencida, y decirle al
+    // usuario que vuelva a entrar no arreglaría nada.
+    if (error && (error.name === 'AuthRetryableFetchError' || !error.status || error.status >= 500)) {
+      return { ok: false, codigo: 503, motivo: 'no se pudo confirmar la sesión (' + error.message + ')' };
+    }
+    const usuario = data && data.user;
+    if (error || !usuario) return { ok: false, codigo: 401, motivo: 'la sesión venció o no es válida' };
+    const { data: fila, error: errFila } = await sb.schema('ops').from('usuarios')
+      .select('id, activo').eq('id', usuario.id).maybeSingle();
+    if (errFila) return { ok: false, codigo: 503, motivo: 'no se pudo confirmar el usuario (' + errFila.message + ')' };
+    // Mismo criterio que ops.es_equipo(): activo vacío cuenta como activo.
+    if (!fila || fila.activo === false) return { ok: false, codigo: 403, motivo: 'el usuario no es del equipo o está dado de baja' };
+    return { ok: true, id: usuario.id, email: usuario.email || null };
+  } catch (e) {
+    return { ok: false, codigo: 503, motivo: 'no se pudo confirmar la sesión (' + e.message + ')' };
+  }
+}
+
 // ── Configuración de AFIP SDK ──
 // Todas estas variables se cargan desde Railway (Settings → Variables), nunca
 // hardcodeadas acá. AFIP_PRODUCTION debe quedar en "false" hasta que probemos
@@ -174,26 +244,48 @@ async function emitirComprobante({ sucursal_id, punto_venta, tipo_comprobante, t
 }
 
 const server = http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  ponerCors(req, res);
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   // ── Chequeo de salud + estado de los servidores de ARCA ──
+  // También dice si /facturar ya exige la sesión: es lo que hay que mirar
+  // antes de desplegar el Cyron que manda el token, y después de prender
+  // EXIGIR_SESION.
   if (req.method === 'GET' && req.url === '/salud') {
+    const proteccion = {
+      sesion: EXIGIR_SESION ? 'exigida' : 'sin exigir (falta EXIGIR_SESION=si)',
+      origenes: ORIGENES.length ? ORIGENES : 'cualquiera',
+    };
     try {
       const estadoArca = await afip.ElectronicBilling.getServerStatus();
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, ambiente: afip.options.production ? 'PRODUCCIÓN' : 'homologación', arca: estadoArca }));
+      res.end(JSON.stringify({ ok: true, ambiente: afip.options.production ? 'PRODUCCIÓN' : 'homologación', ...proteccion, arca: estadoArca }));
     } catch (e) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: e.message }));
+      res.end(JSON.stringify({ ok: false, error: e.message, ...proteccion }));
     }
     return;
   }
 
   // ── Emitir un comprobante ──
   if (req.method === 'POST' && req.url === '/facturar') {
+    // Primero quién lo pide. Si no se le puede creer y la sesión es
+    // obligatoria, se corta acá: no se lee nada ni se llama a ARCA, así
+    // que no hay comprobante a medias. Cyron lo muestra como "facturar a
+    // mano después", igual que cualquier factura que no salió.
+    const quien = await quienPide(req);
+    if (!quien.ok) {
+      if (EXIGIR_SESION) {
+        console.warn(`⛔ /facturar rechazado: ${quien.motivo}`);
+        res.writeHead(quien.codigo, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `No se emitió: ${quien.motivo}. Volvé a iniciar sesión en Cyron y facturala de nuevo.` }));
+        return;
+      }
+      console.warn(`⚠ /facturar sin sesión válida (${quien.motivo}). Pasa porque EXIGIR_SESION no está prendido.`);
+    } else {
+      console.log(`🧾 Factura pedida por ${quien.email || quien.id}`);
+    }
+
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
@@ -284,4 +376,8 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🧾 Belavita Facturación escuchando en el puerto ${PORT}`);
   console.log(`📍 Ambiente: ${afip.options.production ? 'PRODUCCIÓN (facturas reales)' : 'HOMOLOGACIÓN (pruebas, no válidas fiscalmente)'}`);
+  console.log(EXIGIR_SESION
+    ? '🔒 /facturar exige la sesión de un usuario activo del equipo'
+    : '⚠ /facturar todavía NO exige sesión: prendé EXIGIR_SESION=si cuando Cyron ya mande el token');
+  if (ORIGENES.length) console.log(`🌐 Navegadores permitidos: ${ORIGENES.join(', ')}`);
 });
